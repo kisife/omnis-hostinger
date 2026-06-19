@@ -1,38 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OMNIS API — kisife.cloud</title>
-<style>
-:root{--bg:#030305;--bg2:#0A0A10;--fg:#F8FAFC;--muted:#94A3B8;--accent:#22D3EE}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:2rem}
-h1{font-size:clamp(40px,8vw,80px);font-weight:700;background:linear-gradient(135deg,#0EA5E9,#22D3EE,#818CF8,#C084FC);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-p{color:var(--muted);max-width:600px;margin:20px auto;font-size:18px;line-height:1.6}
-.status{display:inline-flex;align-items:center;gap:8px;padding:8px 20px;border-radius:999px;background:rgba(16,185,129,0.15);color:#34D399;font-size:14px;font-weight:500;margin-top:24px}
-.dot{width:8px;height:8px;border-radius:50%;background:#34D399;animation:pulse 2s infinite}
-@keyframes pulse{0%{opacity:1}50%{opacity:.5}100%{opacity:1}}
-.endpoints{margin-top:40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;max-width:800px;width:100%;text-align:left}
-.ep{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px}
-.ep code{font-size:12px;color:var(--accent);font-family:monospace}
-.ep p{font-size:13px;color:var(--muted);margin:8px 0 0;text-align:left}
-.footer{margin-top:auto;padding:40px;color:var(--muted);font-size:13px}
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OMNIS Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script type="module" crossorigin src="/assets/index-Brz73oXQ.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-ASwptzFi.css">
 </head>
-<body>
-<h1>OMNIS API</h1>
-<p>Autonomous web creation platform. Backend running on kisife.cloud via Hostinger Node.js.</p>
-<div class="status"><span class="dot"></span> System Operational</div>
-<div class="endpoints">
-<div class="ep"><code>GET /api/ping</code><p>Health check endpoint</p></div>
-<div class="ep"><code>POST /api/trpc/dashboard.stats</code><p>Dashboard statistics</p></div>
-<div class="ep"><code>POST /api/trpc/lead.list</code><p>Lead management</p></div>
-<div class="ep"><code>POST /api/trpc/agentLog.list</code><p>Agent activity logs</p></div>
-</div>
-<div class="footer">
-<p>OMNIS Systems &copy; 2026 | Powered by Hostinger Node.js + SQLite</p>
-<p style="margin-top:8px;font-size:12px">Frontend: <a href="https://www.kisife.com" style="color:var(--accent)">www.kisife.com</a></p>
-</div>
+<body class="bg-[#030305] text-[#F8FAFC] antialiased" style="font-family: 'Inter', sans-serif;">
+  <div id="root"></div>
 </body>
 </html>

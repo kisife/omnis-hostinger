@@ -224,6 +224,16 @@ if (clientsCount.c === 0) {
   for (const u of users) insertUser.run(...u);
 }
 
+// ── Helper: parse tRPC body ───────────────────────────────────
+async function parseBody(c) {
+  try {
+    const body = await c.req.json();
+    return body?.json || body || {};
+  } catch {
+    return {};
+  }
+}
+
 // ── Hono App ───────────────────────────────────────────────────
 const app = new Hono();
 
@@ -249,7 +259,7 @@ app.use("*", async (c, next) => {
 app.get("/api/ping", (c) => c.json({ ok: true, ts: Date.now() }));
 app.get("/api/trpc/ping", (c) => c.json({ ok: true, ts: Date.now() }));
 
-// Auth
+// ── Auth ───────────────────────────────────────────────────────
 app.get("/api/trpc/auth.me", (c) => {
   const user = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get("demo_user");
   return c.json({ result: { data: user || { id: 1, unionId: "demo_user", name: "CEO", email: "ceo@omnis.systems", role: "admin" } } });
@@ -257,7 +267,14 @@ app.get("/api/trpc/auth.me", (c) => {
 
 app.post("/api/trpc/auth.logout", (c) => c.json({ result: { data: { success: true } } }));
 
-// Dashboard stats
+// OAuth callback (redirect to dashboard with session)
+app.get("/api/oauth/callback", (c) => {
+  const code = c.req.query("code");
+  if (!code) return c.text("Missing code", 400);
+  return c.redirect("/dashboard", 302);
+});
+
+// ── Dashboard ──────────────────────────────────────────────────
 app.post("/api/trpc/dashboard.stats", (c) => {
   const leads = sqlite.prepare("SELECT COUNT(*) as c FROM business_leads").get();
   const clients = sqlite.prepare("SELECT COUNT(*) as c FROM clients WHERE client_status = 'active'").get();
@@ -266,11 +283,9 @@ app.post("/api/trpc/dashboard.stats", (c) => {
   return c.json({ result: { data: { leads: { total: leads?.c || 0 }, clients: { active: clients?.c || 0 }, revenue: { total: String(payments?.c || 0), mrr: String(mrr?.c || 0) }, proposals: [], contracts: [], projects: [] } } });
 });
 
-// Recent activity
 app.post("/api/trpc/dashboard.recentActivity", async (c) => {
-  let body = {};
-  try { body = await c.req.json(); } catch {}
-  const limit = body?.json?.limit || 10;
+  const body = await parseBody(c);
+  const limit = body?.limit || 10;
   const recentLeads = sqlite.prepare("SELECT * FROM business_leads ORDER BY created_at DESC LIMIT ?").all(limit);
   const recentClients = sqlite.prepare("SELECT * FROM clients ORDER BY created_at DESC LIMIT ?").all(limit);
   const recentPayments = sqlite.prepare("SELECT * FROM payments ORDER BY created_at DESC LIMIT ?").all(limit);
@@ -279,7 +294,6 @@ app.post("/api/trpc/dashboard.recentActivity", async (c) => {
   return c.json({ result: { data: { recentLeads, recentClients, recentPayments, recentLogs, recentWorkflows } } });
 });
 
-// Pipeline
 app.post("/api/trpc/dashboard.pipeline", (c) => {
   const leadsByStatus = sqlite.prepare("SELECT status, COUNT(*) as count FROM business_leads GROUP BY status").all();
   const clientsByStatus = sqlite.prepare("SELECT client_status as status, COUNT(*) as count FROM clients GROUP BY client_status").all();
@@ -288,52 +302,577 @@ app.post("/api/trpc/dashboard.pipeline", (c) => {
   return c.json({ result: { data: { leadsByStatus, clientsByStatus, paymentsByType, agentActivityByType: agentByType, workflowsByType: [] } } });
 });
 
-// Lead list
+// ── Leads CRUD ───────────────────────────────────────────────
 app.post("/api/trpc/lead.list", async (c) => {
-  let body = {};
-  try { body = await c.req.json(); } catch {}
-  const limit = body?.json?.limit || 50;
-  const offset = body?.json?.offset || 0;
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
   const items = sqlite.prepare("SELECT * FROM business_leads ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
   const count = sqlite.prepare("SELECT COUNT(*) as c FROM business_leads").get();
   return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
 });
 
-// Lead stats
+app.post("/api/trpc/lead.getById", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ result: { data: null } });
+  const item = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(id);
+  return c.json({ result: { data: item || null } });
+});
+
+app.post("/api/trpc/lead.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO business_leads (business_name, category, address, phone, email, has_website, discovery_source, status, assigned_agent, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.business_name || "",
+    body.category || null,
+    body.address || null,
+    body.phone || null,
+    body.email || null,
+    body.has_website ? 1 : 0,
+    body.discovery_source || null,
+    body.status || "new",
+    body.assigned_agent || null,
+    body.notes || null,
+    now,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/lead.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Lead not found" } }, 404);
+
+  const now = Date.now();
+  sqlite.prepare(
+    "UPDATE business_leads SET business_name = ?, category = ?, address = ?, phone = ?, email = ?, has_website = ?, discovery_source = ?, status = ?, assigned_agent = ?, notes = ?, updated_at = ? WHERE id = ?"
+  ).run(
+    body.business_name ?? existing.business_name,
+    body.category ?? existing.category,
+    body.address ?? existing.address,
+    body.phone ?? existing.phone,
+    body.email ?? existing.email,
+    body.has_website !== undefined ? (body.has_website ? 1 : 0) : existing.has_website,
+    body.discovery_source ?? existing.discovery_source,
+    body.status ?? existing.status,
+    body.assigned_agent ?? existing.assigned_agent,
+    body.notes ?? existing.notes,
+    now,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/lead.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM business_leads WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
 app.post("/api/trpc/lead.stats", (c) => {
   const result = sqlite.prepare("SELECT status, COUNT(*) as count FROM business_leads GROUP BY status").all();
   return c.json({ result: { data: result } });
 });
 
-// Agent logs
-app.post("/api/trpc/agentLog.list", async (c) => {
-  let body = {};
-  try { body = await c.req.json(); } catch {}
-  const limit = body?.json?.limit || 50;
-  const offset = body?.json?.offset || 0;
-  const items = sqlite.prepare("SELECT * FROM agent_logs ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
-  return c.json({ result: { data: { items } } });
+// ── Clients CRUD ─────────────────────────────────────────────
+app.post("/api/trpc/client.list", async (c) => {
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
+  const items = sqlite.prepare("SELECT * FROM clients ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  const count = sqlite.prepare("SELECT COUNT(*) as c FROM clients").get();
+  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
 });
 
-// Website projects
+app.post("/api/trpc/client.getById", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ result: { data: null } });
+  const item = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(id);
+  return c.json({ result: { data: item || null } });
+});
+
+app.post("/api/trpc/client.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO clients (lead_id, contract_id, client_status, website_url, last_payment_at, next_payment_at, total_revenue, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.lead_id || 0,
+    body.contract_id || 0,
+    body.client_status || "active",
+    body.website_url || null,
+    body.last_payment_at || null,
+    body.next_payment_at || null,
+    body.total_revenue || 0,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/client.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Client not found" } }, 404);
+
+  sqlite.prepare(
+    "UPDATE clients SET lead_id = ?, contract_id = ?, client_status = ?, website_url = ?, last_payment_at = ?, next_payment_at = ?, total_revenue = ? WHERE id = ?"
+  ).run(
+    body.lead_id ?? existing.lead_id,
+    body.contract_id ?? existing.contract_id,
+    body.client_status ?? existing.client_status,
+    body.website_url ?? existing.website_url,
+    body.last_payment_at ?? existing.last_payment_at,
+    body.next_payment_at ?? existing.next_payment_at,
+    body.total_revenue ?? existing.total_revenue,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/client.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM clients WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── Proposals CRUD ────────────────────────────────────────────
+app.post("/api/trpc/proposal.list", async (c) => {
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
+  const items = sqlite.prepare("SELECT * FROM proposals ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  const count = sqlite.prepare("SELECT COUNT(*) as c FROM proposals").get();
+  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
+});
+
+app.post("/api/trpc/proposal.getById", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ result: { data: null } });
+  const item = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(id);
+  return c.json({ result: { data: item || null } });
+});
+
+app.post("/api/trpc/proposal.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO proposals (lead_id, project_id, proposal_type, monthly_fee, setup_fee, total_price, included_services, status, sent_at, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.lead_id || 0,
+    body.project_id || null,
+    body.proposal_type || null,
+    body.monthly_fee || 0,
+    body.setup_fee || 0,
+    body.total_price || 0,
+    body.included_services || null,
+    body.status || "draft",
+    body.sent_at || null,
+    body.expires_at || null,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/proposal.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Proposal not found" } }, 404);
+
+  sqlite.prepare(
+    "UPDATE proposals SET lead_id = ?, project_id = ?, proposal_type = ?, monthly_fee = ?, setup_fee = ?, total_price = ?, included_services = ?, status = ?, sent_at = ?, expires_at = ? WHERE id = ?"
+  ).run(
+    body.lead_id ?? existing.lead_id,
+    body.project_id ?? existing.project_id,
+    body.proposal_type ?? existing.proposal_type,
+    body.monthly_fee ?? existing.monthly_fee,
+    body.setup_fee ?? existing.setup_fee,
+    body.total_price ?? existing.total_price,
+    body.included_services ?? existing.included_services,
+    body.status ?? existing.status,
+    body.sent_at ?? existing.sent_at,
+    body.expires_at ?? existing.expires_at,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/proposal.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM proposals WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── Contracts CRUD ──────────────────────────────────────────────
+app.post("/api/trpc/contract.list", async (c) => {
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
+  const items = sqlite.prepare("SELECT * FROM contracts ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  const count = sqlite.prepare("SELECT COUNT(*) as c FROM contracts").get();
+  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
+});
+
+app.post("/api/trpc/contract.getById", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ result: { data: null } });
+  const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  return c.json({ result: { data: item || null } });
+});
+
+app.post("/api/trpc/contract.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO contracts (proposal_id, lead_id, contract_type, contract_status, contract_content, signature_url, signed_at, expires_at, monthly_recurring_revenue, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.proposal_id || 0,
+    body.lead_id || 0,
+    body.contract_type || null,
+    body.contract_status || "draft",
+    body.contract_content || null,
+    body.signature_url || null,
+    body.signed_at || null,
+    body.expires_at || null,
+    body.monthly_recurring_revenue || 0,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/contract.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Contract not found" } }, 404);
+
+  sqlite.prepare(
+    "UPDATE contracts SET proposal_id = ?, lead_id = ?, contract_type = ?, contract_status = ?, contract_content = ?, signature_url = ?, signed_at = ?, expires_at = ?, monthly_recurring_revenue = ? WHERE id = ?"
+  ).run(
+    body.proposal_id ?? existing.proposal_id,
+    body.lead_id ?? existing.lead_id,
+    body.contract_type ?? existing.contract_type,
+    body.contract_status ?? existing.contract_status,
+    body.contract_content ?? existing.contract_content,
+    body.signature_url ?? existing.signature_url,
+    body.signed_at ?? existing.signed_at,
+    body.expires_at ?? existing.expires_at,
+    body.monthly_recurring_revenue ?? existing.monthly_recurring_revenue,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/contract.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM contracts WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── Website Projects CRUD ──────────────────────────────────────
 app.post("/api/trpc/website_project.list", async (c) => {
-  let body = {};
-  try { body = await c.req.json(); } catch {}
-  const limit = body?.json?.limit || 20;
-  const offset = body?.json?.offset || 0;
+  const body = await parseBody(c);
+  const limit = body?.limit || 20;
+  const offset = body?.offset || 0;
   const items = sqlite.prepare("SELECT * FROM website_projects ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
   const count = sqlite.prepare("SELECT COUNT(*) as c FROM website_projects").get();
   return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
 });
 
-// OAuth callback
-app.get("/api/oauth/callback", (c) => {
-  const code = c.req.query("code");
-  if (!code) return c.text("Missing code", 400);
-  return c.redirect("/dashboard", 302);
+app.post("/api/trpc/website_project.getById", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ result: { data: null } });
+  const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  return c.json({ result: { data: item || null } });
 });
 
-// SPA fallback
+app.post("/api/trpc/website_project.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO website_projects (lead_id, project_name, status, design_url, template_used, pages_built, total_pages, build_progress, preview_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.lead_id || 0,
+    body.project_name || null,
+    body.status || "draft",
+    body.design_url || null,
+    body.template_used || null,
+    body.pages_built || 0,
+    body.total_pages || 5,
+    body.build_progress || 0,
+    body.preview_url || null,
+    now,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/website_project.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Project not found" } }, 404);
+
+  const now = Date.now();
+  sqlite.prepare(
+    "UPDATE website_projects SET lead_id = ?, project_name = ?, status = ?, design_url = ?, template_used = ?, pages_built = ?, total_pages = ?, build_progress = ?, preview_url = ?, updated_at = ? WHERE id = ?"
+  ).run(
+    body.lead_id ?? existing.lead_id,
+    body.project_name ?? existing.project_name,
+    body.status ?? existing.status,
+    body.design_url ?? existing.design_url,
+    body.template_used ?? existing.template_used,
+    body.pages_built ?? existing.pages_built,
+    body.total_pages ?? existing.total_pages,
+    body.build_progress ?? existing.build_progress,
+    body.preview_url ?? existing.preview_url,
+    now,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/website_project.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM website_projects WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── Payments CRUD ─────────────────────────────────────────────
+app.post("/api/trpc/payment.list", async (c) => {
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
+  const items = sqlite.prepare("SELECT * FROM payments ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  const count = sqlite.prepare("SELECT COUNT(*) as c FROM payments").get();
+  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
+});
+
+app.post("/api/trpc/payment.getById", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ result: { data: null } });
+  const item = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(id);
+  return c.json({ result: { data: item || null } });
+});
+
+app.post("/api/trpc/payment.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO payments (client_id, amount, payment_type, status, paid_at, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.client_id || 0,
+    body.amount || 0,
+    body.payment_type || null,
+    body.status || "pending",
+    body.paid_at || null,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/payment.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Payment not found" } }, 404);
+
+  sqlite.prepare(
+    "UPDATE payments SET client_id = ?, amount = ?, payment_type = ?, status = ?, paid_at = ? WHERE id = ?"
+  ).run(
+    body.client_id ?? existing.client_id,
+    body.amount ?? existing.amount,
+    body.payment_type ?? existing.payment_type,
+    body.status ?? existing.status,
+    body.paid_at ?? existing.paid_at,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/payment.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM payments WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── Agent Logs ───────────────────────────────────────────────
+app.post("/api/trpc/agentLog.list", async (c) => {
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
+  const items = sqlite.prepare("SELECT * FROM agent_logs ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  return c.json({ result: { data: { items } } });
+});
+
+app.post("/api/trpc/agentLog.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO agent_logs (agent_name, agent_type, action, target_lead_id, status, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.agent_name || null,
+    body.agent_type || null,
+    body.action || null,
+    body.target_lead_id || null,
+    body.status || null,
+    body.metadata ? JSON.stringify(body.metadata) : null,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM agent_logs WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+// ── Workflow Runs ──────────────────────────────────────────────
+app.post("/api/trpc/workflow.list", async (c) => {
+  const body = await parseBody(c);
+  const limit = body?.limit || 50;
+  const offset = body?.offset || 0;
+  const items = sqlite.prepare("SELECT * FROM workflow_runs ORDER BY started_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  const count = sqlite.prepare("SELECT COUNT(*) as c FROM workflow_runs").get();
+  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
+});
+
+app.post("/api/trpc/workflow.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO workflow_runs (workflow_name, workflow_type, status, steps_completed, total_steps, started_at, completed_at, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.workflow_name || null,
+    body.workflow_type || null,
+    body.status || "pending",
+    body.steps_completed || 0,
+    body.total_steps || 0,
+    now,
+    body.completed_at || null,
+    body.error_message || null
+  );
+  const item = sqlite.prepare("SELECT * FROM workflow_runs WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/workflow.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM workflow_runs WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Workflow not found" } }, 404);
+
+  sqlite.prepare(
+    "UPDATE workflow_runs SET workflow_name = ?, workflow_type = ?, status = ?, steps_completed = ?, total_steps = ?, completed_at = ?, error_message = ? WHERE id = ?"
+  ).run(
+    body.workflow_name ?? existing.workflow_name,
+    body.workflow_type ?? existing.workflow_type,
+    body.status ?? existing.status,
+    body.steps_completed ?? existing.steps_completed,
+    body.total_steps ?? existing.total_steps,
+    body.completed_at ?? existing.completed_at,
+    body.error_message ?? existing.error_message,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM workflow_runs WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+// ── Users ──────────────────────────────────────────────────────
+app.post("/api/trpc/user.list", async (c) => {
+  const items = sqlite.prepare("SELECT id, unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt FROM users ORDER BY createdAt DESC").all();
+  return c.json({ result: { data: { items } } });
+});
+
+app.post("/api/trpc/user.create", async (c) => {
+  const body = await parseBody(c);
+  const now = Date.now();
+  const result = sqlite.prepare(
+    "INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    body.unionId || "",
+    body.name || null,
+    body.email || null,
+    body.avatar || null,
+    body.role || "user",
+    now,
+    now,
+    now
+  );
+  const item = sqlite.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/user.update", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM users WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "User not found" } }, 404);
+
+  const now = Date.now();
+  sqlite.prepare(
+    "UPDATE users SET unionId = ?, name = ?, email = ?, avatar = ?, role = ?, updatedAt = ? WHERE id = ?"
+  ).run(
+    body.unionId ?? existing.unionId,
+    body.name ?? existing.name,
+    body.email ?? existing.email,
+    body.avatar ?? existing.avatar,
+    body.role ?? existing.role,
+    now,
+    id
+  );
+  const item = sqlite.prepare("SELECT * FROM users WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/user.delete", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  sqlite.prepare("DELETE FROM users WHERE id = ?").run(id);
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── SPA fallback ───────────────────────────────────────────────
 const publicPath = path.join(__dirname, "public");
 if (fs.existsSync(publicPath)) {
   app.use("*", serveStatic({ root: "./public" }));

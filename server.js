@@ -1,13 +1,69 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import "dotenv/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ── JWT Helpers ────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString("hex");
+
+function signJWT(payload, expiresIn = "7d") {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const exp = Math.floor(Date.now() / 1000) + (expiresIn === "7d" ? 7 * 24 * 60 * 60 : parseInt(expiresIn));
+  const body = Buffer.from(JSON.stringify({ ...payload, exp, iat: Math.floor(Date.now() / 1000) })).toString("base64url");
+  const signature = createHmac("sha256", JWT_SECRET).update(`${header}.${body}`).digest("base64url");
+  return `${header}.${body}.${signature}`;
+}
+
+function verifyJWT(token) {
+  try {
+    const [header, body, signature] = token.split(".");
+    if (!header || !body || !signature) return null;
+    const expectedSignature = createHmac("sha256", JWT_SECRET).update(`${header}.${body}`).digest("base64url");
+    if (!timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) return null;
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString());
+    if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// ── OAuth State Management ─────────────────────────────────────
+const oauthStates = new Map();
+function cleanupStates() {
+  const now = Date.now();
+  for (const [key, value] of oauthStates) {
+    if (value < now) oauthStates.delete(key);
+  }
+}
+setInterval(cleanupStates, 60000);
+
+function generateState() {
+  const state = randomBytes(16).toString("hex");
+  oauthStates.set(state, Date.now() + 10 * 60 * 1000); // 10 min TTL
+  return state;
+}
+
+function verifyState(state) {
+  if (!state || !oauthStates.has(state)) return false;
+  oauthStates.delete(state);
+  return true;
+}
+
+// ── OAuth Config ─────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || "";
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || "";
+const OAUTH_REDIRECT_URL = process.env.OAUTH_REDIRECT_URL || "https://www.kisife.com";
 
 // ── Initialize SQLite ──────────────────────────────────────────
 const dbPath = path.join(__dirname, "omnis.db");
@@ -135,13 +191,12 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 );
 `);
 
-// ── Seed data ────────────────────────────────────────────────
+// ── Seed data ────────────────────────────────────────────────────
 const now = Date.now();
 const day = 86400000;
 
 const clientsCount = sqlite.prepare("SELECT COUNT(*) as c FROM clients").get();
 if (clientsCount.c === 0) {
-  // Clear all tables to ensure clean re-seed
   sqlite.exec("DELETE FROM users");
   sqlite.exec("DELETE FROM agent_logs");
   sqlite.exec("DELETE FROM workflow_runs");
@@ -234,6 +289,15 @@ async function parseBody(c) {
   }
 }
 
+// ── Helper: get current user from JWT ──────────────────────────
+function getCurrentUser(c) {
+  const token = getCookie(c, "omnis_session");
+  if (!token) return null;
+  const payload = verifyJWT(token);
+  if (!payload) return null;
+  return sqlite.prepare("SELECT * FROM users WHERE id = ?").get(payload.userId) || null;
+}
+
 // ── Hono App ───────────────────────────────────────────────────
 const app = new Hono();
 
@@ -260,18 +324,174 @@ app.get("/api/ping", (c) => c.json({ ok: true, ts: Date.now() }));
 app.get("/api/trpc/ping", (c) => c.json({ ok: true, ts: Date.now() }));
 
 // ── Auth ───────────────────────────────────────────────────────
-app.get("/api/trpc/auth.me", (c) => {
-  const user = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get("demo_user");
-  return c.json({ result: { data: user || { id: 1, unionId: "demo_user", name: "CEO", email: "ceo@omnis.systems", role: "admin" } } });
+app.get("/api/auth/google", (c) => {
+  if (!GOOGLE_CLIENT_ID) return c.json({ error: "Google OAuth not configured" }, 500);
+  const state = generateState();
+  const redirectUri = `${OAUTH_REDIRECT_URL}/api/auth/google/callback`;
+  const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  authUrl.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("scope", "openid email profile");
+  authUrl.searchParams.set("state", state);
+  authUrl.searchParams.set("access_type", "offline");
+  authUrl.searchParams.set("prompt", "consent");
+  return c.redirect(authUrl.toString(), 302);
 });
 
-app.post("/api/trpc/auth.logout", (c) => c.json({ result: { data: { success: true } } }));
-
-// OAuth callback (redirect to dashboard with session)
-app.get("/api/oauth/callback", (c) => {
+app.get("/api/auth/google/callback", async (c) => {
   const code = c.req.query("code");
-  if (!code) return c.text("Missing code", 400);
-  return c.redirect("/dashboard", 302);
+  const state = c.req.query("state");
+  if (!code || !verifyState(state)) return c.json({ error: "Invalid state or missing code" }, 400);
+
+  try {
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        code,
+        redirect_uri: `${OAUTH_REDIRECT_URL}/api/auth/google/callback`,
+        grant_type: "authorization_code",
+      }),
+    });
+    const tokenData = await tokenResponse.json();
+    if (!tokenData.access_token) return c.json({ error: "Failed to get access token" }, 400);
+
+    const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const userData = await userResponse.json();
+    if (!userData.id) return c.json({ error: "Failed to get user info" }, 400);
+
+    const unionId = `google_${userData.id}`;
+    const existingUser = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
+    const timestamp = Date.now();
+
+    if (existingUser) {
+      sqlite.prepare("UPDATE users SET name = ?, email = ?, avatar = ?, lastSignInAt = ? WHERE id = ?")
+        .run(userData.name || existingUser.name, userData.email || existingUser.email, userData.picture || existingUser.avatar, timestamp, existingUser.id);
+    } else {
+      sqlite.prepare("INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(unionId, userData.name || userData.email, userData.email, userData.picture, "user", timestamp, timestamp, timestamp);
+    }
+
+    const user = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
+    const token = signJWT({ userId: user.id, unionId: user.unionId, email: user.email, role: user.role });
+
+    setCookie(c, "omnis_session", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "Lax",
+      maxAge: 7 * 24 * 60 * 60,
+      path: "/",
+    });
+
+    return c.redirect("https://dashboard.kisife.com", 302);
+  } catch (err) {
+    console.error("Google OAuth error:", err);
+    return c.json({ error: "OAuth failed", details: err.message }, 500);
+  }
+});
+
+app.get("/api/auth/github", (c) => {
+  if (!GITHUB_CLIENT_ID) return c.json({ error: "GitHub OAuth not configured" }, 500);
+  const state = generateState();
+  const redirectUri = `${OAUTH_REDIRECT_URL}/api/auth/github/callback`;
+  const authUrl = new URL("https://github.com/login/oauth/authorize");
+  authUrl.searchParams.set("client_id", GITHUB_CLIENT_ID);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("scope", "read:user user:email");
+  authUrl.searchParams.set("state", state);
+  return c.redirect(authUrl.toString(), 302);
+});
+
+app.get("/api/auth/github/callback", async (c) => {
+  const code = c.req.query("code");
+  const state = c.req.query("state");
+  if (!code || !verifyState(state)) return c.json({ error: "Invalid state or missing code" }, 400);
+
+  try {
+    const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: `${OAUTH_REDIRECT_URL}/api/auth/github/callback`,
+      }),
+    });
+    const tokenData = await tokenResponse.json();
+    if (!tokenData.access_token) return c.json({ error: "Failed to get access token" }, 400);
+
+    const userResponse = await fetch("https://api.github.com/user", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "User-Agent": "OMNIS-App",
+      },
+    });
+    const userData = await userResponse.json();
+    if (!userData.id) return c.json({ error: "Failed to get user info" }, 400);
+
+    let email = userData.email;
+    if (!email) {
+      const emailResponse = await fetch("https://api.github.com/user/emails", {
+        headers: {
+          Authorization: `Bearer ${tokenData.access_token}`,
+          "User-Agent": "OMNIS-App",
+        },
+      });
+      const emails = await emailResponse.json();
+      if (Array.isArray(emails) && emails.length > 0) {
+        const primary = emails.find(e => e.primary) || emails[0];
+        email = primary.email;
+      }
+    }
+
+    const unionId = `github_${userData.id}`;
+    const existingUser = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
+    const timestamp = Date.now();
+
+    if (existingUser) {
+      sqlite.prepare("UPDATE users SET name = ?, email = ?, avatar = ?, lastSignInAt = ? WHERE id = ?")
+        .run(userData.name || userData.login || existingUser.name, email || existingUser.email, userData.avatar_url || existingUser.avatar, timestamp, existingUser.id);
+    } else {
+      sqlite.prepare("INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(unionId, userData.name || userData.login, email, userData.avatar_url, "user", timestamp, timestamp, timestamp);
+    }
+
+    const user = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
+    const token = signJWT({ userId: user.id, unionId: user.unionId, email: user.email, role: user.role });
+
+    setCookie(c, "omnis_session", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "Lax",
+      maxAge: 7 * 24 * 60 * 60,
+      path: "/",
+    });
+
+    return c.redirect("https://dashboard.kisife.com", 302);
+  } catch (err) {
+    console.error("GitHub OAuth error:", err);
+    return c.json({ error: "OAuth failed", details: err.message }, 500);
+  }
+});
+
+app.post("/api/trpc/auth.me", (c) => {
+  const user = getCurrentUser(c);
+  if (!user) return c.json({ result: { data: null } });
+  return c.json({ result: { data: { id: user.id, unionId: user.unionId, name: user.name, email: user.email, avatar: user.avatar, role: user.role } } });
+});
+
+app.post("/api/trpc/auth.logout", (c) => {
+  deleteCookie(c, "omnis_session", { path: "/" });
+  return c.json({ result: { data: { success: true } } });
 });
 
 // ── Dashboard ──────────────────────────────────────────────────

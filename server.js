@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS website_projects (
   total_pages INTEGER DEFAULT 5,
   build_progress INTEGER DEFAULT 0,
   preview_url TEXT,
+  staging_url TEXT,
+  approved_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -164,6 +166,17 @@ CREATE TABLE IF NOT EXISTS contracts (
   signed_at INTEGER,
   expires_at INTEGER,
   monthly_recurring_revenue REAL,
+  approved_at INTEGER,
+  approved_by INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contract_approvals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contract_id INTEGER NOT NULL,
+  approver_id INTEGER,
+  action TEXT NOT NULL,
+  notes TEXT,
   created_at INTEGER NOT NULL
 );
 
@@ -224,6 +237,7 @@ if (clientsCount.c === 0) {
   sqlite.exec("DELETE FROM workflow_runs");
   sqlite.exec("DELETE FROM payments");
   sqlite.exec("DELETE FROM clients");
+  sqlite.exec("DELETE FROM contract_approvals");
   sqlite.exec("DELETE FROM contracts");
   sqlite.exec("DELETE FROM proposals");
   sqlite.exec("DELETE FROM website_projects");
@@ -249,11 +263,21 @@ if (clientsCount.c === 0) {
   for (const p of proposals) insertProposal.run(...p);
 
   const contracts = [
-    [1, 6, "full_ownership", "signed", "Full ownership $2,499", null, now-105*day, now+365*day, 0, now-105*day],
-    [2, 7, "subscription", "signed", "Annual subscription $149/mo", null, now-135*day, now+365*day, 149, now-135*day],
+    [1, 6, "full_ownership", "signed", "Full ownership $2,499", null, now-105*day, now+365*day, 0, 1, now-110*day, now-105*day],
+    [2, 7, "subscription", "signed", "Annual subscription $149/mo", null, now-135*day, now+365*day, 149, 1, now-140*day, now-135*day],
+    [null, 3, "full_ownership", "pending_approval", "Website design package $1,999 for Elite Fitness. Includes 5 pages, booking system, mobile responsive.", null, null, null, 0, null, null, now-5*day],
+    [null, 4, "subscription", "draft", "Monthly subscription $149/mo for River Valley Plumbing. Includes hosting, updates, support.", null, null, null, 149, null, null, now-2*day],
   ];
-  const insertContract = sqlite.prepare("INSERT INTO contracts (proposal_id, lead_id, contract_type, contract_status, contract_content, signature_url, signed_at, expires_at, monthly_recurring_revenue, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  const insertContract = sqlite.prepare("INSERT INTO contracts (proposal_id, lead_id, contract_type, contract_status, contract_content, signature_url, signed_at, expires_at, monthly_recurring_revenue, approved_by, approved_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
   for (const c of contracts) insertContract.run(...c);
+
+  const projects = [
+    [6, "Golden Paws Website", "approved", null, "pet_grooming_v2", 6, 6, 100, "https://goldenpaws.com", "https://staging.goldenpaws.com", now-70*day, now-60*day, now-60*day],
+    [7, "Precision Tax Website", "approved", null, "professional_v1", 5, 5, 100, "https://precisiontax.com", "https://staging.precisiontax.com", now-120*day, now-110*day, now-110*day],
+    [3, "Elite Fitness Website", "staging", null, "fitness_v3", 3, 5, 60, null, "https://staging.elitefitness.com", null, now-3*day, now-3*day],
+  ];
+  const insertProject = sqlite.prepare("INSERT INTO website_projects (lead_id, project_name, status, design_url, template_used, pages_built, total_pages, build_progress, preview_url, staging_url, approved_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  for (const p of projects) insertProject.run(...p);
 
   const clients = [
     [6, 1, "active", "https://goldenpaws.com", now-30*day, null, 2499, now-120*day],
@@ -506,7 +530,9 @@ app.post("/api/trpc/dashboard.stats", (c) => {
   const clients = sqlite.prepare("SELECT COUNT(*) as c FROM clients WHERE client_status = 'active'").get();
   const payments = sqlite.prepare("SELECT COALESCE(SUM(amount), 0) as c FROM payments WHERE status = 'completed'").get();
   const mrr = sqlite.prepare("SELECT COALESCE(SUM(monthly_recurring_revenue), 0) as c FROM contracts WHERE contract_status = 'signed'").get();
-  return c.json({ result: { data: { leads: { total: leads?.c || 0 }, clients: { active: clients?.c || 0 }, revenue: { total: String(payments?.c || 0), mrr: String(mrr?.c || 0) }, proposals: [], contracts: [], projects: [] } } });
+  const pendingContracts = sqlite.prepare("SELECT COUNT(*) as c FROM contracts WHERE contract_status = 'pending_approval'").get();
+  const stagingProjects = sqlite.prepare("SELECT COUNT(*) as c FROM website_projects WHERE status = 'staging'").get();
+  return c.json({ result: { data: { leads: { total: leads?.c || 0 }, clients: { active: clients?.c || 0 }, revenue: { total: String(payments?.c || 0), mrr: String(mrr?.c || 0) }, pendingContracts: pendingContracts?.c || 0, stagingProjects: stagingProjects?.c || 0, proposals: [], contracts: [], projects: [] } } });
 });
 
 app.post("/api/trpc/dashboard.recentActivity", async (c) => {
@@ -525,7 +551,9 @@ app.post("/api/trpc/dashboard.pipeline", (c) => {
   const clientsByStatus = sqlite.prepare("SELECT client_status as status, COUNT(*) as count FROM clients GROUP BY client_status").all();
   const paymentsByType = sqlite.prepare("SELECT payment_type as type, COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed' GROUP BY payment_type").all();
   const agentByType = sqlite.prepare("SELECT agent_type as type, COUNT(*) as count FROM agent_logs GROUP BY agent_type").all();
-  return c.json({ result: { data: { leadsByStatus, clientsByStatus, paymentsByType, agentActivityByType: agentByType, workflowsByType: [] } } });
+  const contractStatus = sqlite.prepare("SELECT contract_status as status, COUNT(*) as count FROM contracts GROUP BY contract_status").all();
+  const projectStatus = sqlite.prepare("SELECT status, COUNT(*) as count FROM website_projects GROUP BY status").all();
+  return c.json({ result: { data: { leadsByStatus, clientsByStatus, paymentsByType, agentActivityByType: agentByType, workflowsByType: [], contractStatus, projectStatus } } });
 });
 
 // ── Leads CRUD ───────────────────────────────────────────────
@@ -720,9 +748,9 @@ app.post("/api/trpc/contract.create", async (c) => {
   const body = await parseBody(c);
   const now = Date.now();
   const result = sqlite.prepare(
-    "INSERT INTO contracts (proposal_id, lead_id, contract_type, contract_status, contract_content, signature_url, signed_at, expires_at, monthly_recurring_revenue, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO contracts (proposal_id, lead_id, contract_type, contract_status, contract_content, signature_url, signed_at, expires_at, monthly_recurring_revenue, approved_by, approved_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(body.proposal_id || 0, body.lead_id || 0, body.contract_type || null, body.contract_status || "draft",
-    body.contract_content || null, body.signature_url || null, body.signed_at || null, body.expires_at || null, body.monthly_recurring_revenue || 0, now);
+    body.contract_content || null, body.signature_url || null, body.signed_at || null, body.expires_at || null, body.monthly_recurring_revenue || 0, body.approved_by || null, body.approved_at || null, now);
   const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -734,10 +762,57 @@ app.post("/api/trpc/contract.update", async (c) => {
   const existing = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Contract not found" } }, 404);
   sqlite.prepare(
-    "UPDATE contracts SET proposal_id = ?, lead_id = ?, contract_type = ?, contract_status = ?, contract_content = ?, signature_url = ?, signed_at = ?, expires_at = ?, monthly_recurring_revenue = ? WHERE id = ?"
+    "UPDATE contracts SET proposal_id = ?, lead_id = ?, contract_type = ?, contract_status = ?, contract_content = ?, signature_url = ?, signed_at = ?, expires_at = ?, monthly_recurring_revenue = ?, approved_by = ?, approved_at = ? WHERE id = ?"
   ).run(body.proposal_id ?? existing.proposal_id, body.lead_id ?? existing.lead_id, body.contract_type ?? existing.contract_type,
     body.contract_status ?? existing.contract_status, body.contract_content ?? existing.contract_content, body.signature_url ?? existing.signature_url,
-    body.signed_at ?? existing.signed_at, body.expires_at ?? existing.expires_at, body.monthly_recurring_revenue ?? existing.monthly_recurring_revenue, id);
+    body.signed_at ?? existing.signed_at, body.expires_at ?? existing.expires_at, body.monthly_recurring_revenue ?? existing.monthly_recurring_revenue,
+    body.approved_by ?? existing.approved_by, body.approved_at ?? existing.approved_at, id);
+  const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/contract.approve", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Contract not found" } }, 404);
+  const now = Date.now();
+  const user = getCurrentUser(c);
+  const userId = user?.id || null;
+  sqlite.prepare("UPDATE contracts SET contract_status = ?, approved_by = ?, approved_at = ? WHERE id = ?")
+    .run("approved", userId, now, id);
+  sqlite.prepare("INSERT INTO contract_approvals (contract_id, approver_id, action, notes, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(id, userId, "approved", body.notes || null, now);
+  const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/contract.reject", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Contract not found" } }, 404);
+  const now = Date.now();
+  const user = getCurrentUser(c);
+  const userId = user?.id || null;
+  sqlite.prepare("UPDATE contracts SET contract_status = ? WHERE id = ?").run("rejected", id);
+  sqlite.prepare("INSERT INTO contract_approvals (contract_id, approver_id, action, notes, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(id, userId, "rejected", body.notes || null, now);
+  const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/contract.send", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Contract not found" } }, 404);
+  if (existing.contract_status !== "approved") return c.json({ error: { message: "Contract must be approved before sending" } }, 400);
+  const now = Date.now();
+  sqlite.prepare("UPDATE contracts SET contract_status = ?, sent_at = ? WHERE id = ?").run("sent", now, id);
   const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -772,9 +847,9 @@ app.post("/api/trpc/website_project.create", async (c) => {
   const body = await parseBody(c);
   const now = Date.now();
   const result = sqlite.prepare(
-    "INSERT INTO website_projects (lead_id, project_name, status, design_url, template_used, pages_built, total_pages, build_progress, preview_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO website_projects (lead_id, project_name, status, design_url, template_used, pages_built, total_pages, build_progress, preview_url, staging_url, approved_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(body.lead_id || 0, body.project_name || null, body.status || "draft", body.design_url || null, body.template_used || null,
-    body.pages_built || 0, body.total_pages || 5, body.build_progress || 0, body.preview_url || null, now, now);
+    body.pages_built || 0, body.total_pages || 5, body.build_progress || 0, body.preview_url || null, body.staging_url || null, body.approved_at || null, now, now);
   const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -787,10 +862,36 @@ app.post("/api/trpc/website_project.update", async (c) => {
   if (!existing) return c.json({ error: { message: "Project not found" } }, 404);
   const now = Date.now();
   sqlite.prepare(
-    "UPDATE website_projects SET lead_id = ?, project_name = ?, status = ?, design_url = ?, template_used = ?, pages_built = ?, total_pages = ?, build_progress = ?, preview_url = ?, updated_at = ? WHERE id = ?"
+    "UPDATE website_projects SET lead_id = ?, project_name = ?, status = ?, design_url = ?, template_used = ?, pages_built = ?, total_pages = ?, build_progress = ?, preview_url = ?, staging_url = ?, approved_at = ?, updated_at = ? WHERE id = ?"
   ).run(body.lead_id ?? existing.lead_id, body.project_name ?? existing.project_name, body.status ?? existing.status,
     body.design_url ?? existing.design_url, body.template_used ?? existing.template_used, body.pages_built ?? existing.pages_built,
-    body.total_pages ?? existing.total_pages, body.build_progress ?? existing.build_progress, body.preview_url ?? existing.preview_url, now, id);
+    body.total_pages ?? existing.total_pages, body.build_progress ?? existing.build_progress, body.preview_url ?? existing.preview_url,
+    body.staging_url ?? existing.staging_url, body.approved_at ?? existing.approved_at, now, id);
+  const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/website_project.approve", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Project not found" } }, 404);
+  const now = Date.now();
+  sqlite.prepare("UPDATE website_projects SET status = ?, approved_at = ? WHERE id = ?")
+    .run("approved", now, id);
+  const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  return c.json({ result: { data: item } });
+});
+
+app.post("/api/trpc/website_project.deploy", async (c) => {
+  const body = await parseBody(c);
+  const id = body?.id;
+  if (!id) return c.json({ error: { message: "ID required" } }, 400);
+  const existing = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
+  if (!existing) return c.json({ error: { message: "Project not found" } }, 404);
+  if (existing.status !== "approved") return c.json({ error: { message: "Project must be approved before deployment" } }, 400);
+  sqlite.prepare("UPDATE website_projects SET status = ? WHERE id = ?").run("deployed", id);
   const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -808,9 +909,10 @@ app.post("/api/trpc/payment.list", async (c) => {
   const body = await parseBody(c);
   const limit = body?.limit || 50;
   const offset = body?.offset || 0;
-  const items = sqlite.prepare("SELECT * FROM payments ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  const items = sqlite.prepare(`SELECT p.*, c.lead_id as client_lead_id, c.website_url as client_website, c.client_status FROM payments p LEFT JOIN clients c ON p.client_id = c.id ORDER BY p.created_at DESC LIMIT ? OFFSET ?`).all(limit, offset);
   const count = sqlite.prepare("SELECT COUNT(*) as c FROM payments").get();
-  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset } } });
+  const byClient = sqlite.prepare(`SELECT c.id as client_id, c.website_url, SUM(p.amount) as total FROM payments p JOIN clients c ON p.client_id = c.id WHERE p.status = 'completed' GROUP BY c.id`).all();
+  return c.json({ result: { data: { items, total: count?.c || 0, limit, offset, byClient } } });
 });
 
 app.post("/api/trpc/payment.getById", async (c) => {

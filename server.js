@@ -92,6 +92,14 @@ const sqlite = new Database(dbPath);
 sqlite.exec("PRAGMA journal_mode = WAL;");
 sqlite.exec("PRAGMA foreign_keys = ON;");
 
+// ── Schema migrations ────────────────────────────────────────────
+// Add new columns if they don't exist (SQLite ALTER TABLE is safe to re-run)
+try { sqlite.exec("ALTER TABLE contracts ADD COLUMN approved_at INTEGER"); } catch {}
+try { sqlite.exec("ALTER TABLE contracts ADD COLUMN approved_by INTEGER"); } catch {}
+try { sqlite.exec("ALTER TABLE website_projects ADD COLUMN staging_url TEXT"); } catch {}
+try { sqlite.exec("ALTER TABLE website_projects ADD COLUMN approved_at INTEGER"); } catch {}
+try { sqlite.exec("CREATE TABLE IF NOT EXISTS contract_approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, contract_id INTEGER NOT NULL, approver_id INTEGER, action TEXT NOT NULL, notes TEXT, created_at INTEGER NOT NULL)"); } catch {}
+
 // Create tables
 sqlite.exec(`
 CREATE TABLE IF NOT EXISTS users (

@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
@@ -12,11 +11,11 @@ import "dotenv/config";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── JWT Helpers ────────────────────────────────────────────────
-const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString("hex");
+const JWT_SECRET = process.env.JWT_SECRET || "omnis-default-secret-change-me-in-production";
 
-function signJWT(payload, expiresIn = "7d") {
+function signJWT(payload, expiresInSeconds = 604800) {
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-  const exp = Math.floor(Date.now() / 1000) + (expiresIn === "7d" ? 7 * 24 * 60 * 60 : parseInt(expiresIn));
+  const exp = Math.floor(Date.now() / 1000) + expiresInSeconds;
   const body = Buffer.from(JSON.stringify({ ...payload, exp, iat: Math.floor(Date.now() / 1000) })).toString("base64url");
   const signature = createHmac("sha256", JWT_SECRET).update(`${header}.${body}`).digest("base64url");
   return `${header}.${body}.${signature}`;
@@ -36,26 +35,31 @@ function verifyJWT(token) {
   }
 }
 
-// ── OAuth State Management ─────────────────────────────────────
-const oauthStates = new Map();
-function cleanupStates() {
-  const now = Date.now();
-  for (const [key, value] of oauthStates) {
-    if (value < now) oauthStates.delete(key);
-  }
-}
-setInterval(cleanupStates, 60000);
-
-function generateState() {
-  const state = randomBytes(16).toString("hex");
-  oauthStates.set(state, Date.now() + 10 * 60 * 1000); // 10 min TTL
-  return state;
+function getTokenFromHeader(c) {
+  const auth = c.req.header("Authorization") || "";
+  if (auth.startsWith("Bearer ")) return auth.slice(7);
+  return null;
 }
 
-function verifyState(state) {
-  if (!state || !oauthStates.has(state)) return false;
-  oauthStates.delete(state);
-  return true;
+function getCurrentUser(c) {
+  const token = getTokenFromHeader(c);
+  if (!token) return null;
+  const payload = verifyJWT(token);
+  if (!payload || !payload.userId) return null;
+  return sqlite.prepare("SELECT id, unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt FROM users WHERE id = ?").get(payload.userId) || null;
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16).toString("hex");
+  const hash = createHmac("sha256", JWT_SECRET + salt).update(password).digest("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const expected = createHmac("sha256", JWT_SECRET + salt).update(password).digest("hex");
+  return timingSafeEqual(Buffer.from(hash), Buffer.from(expected));
 }
 
 // ── OAuth Config ─────────────────────────────────────────────────
@@ -64,6 +68,23 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || "";
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URL = process.env.OAUTH_REDIRECT_URL || "https://www.kisife.com";
+
+// ── OAuth State ─────────────────────────────────────────────────
+const oauthStates = new Map();
+function generateState() {
+  const state = randomBytes(16).toString("hex");
+  oauthStates.set(state, Date.now() + 10 * 60 * 1000);
+  return state;
+}
+function verifyState(state) {
+  if (!state || !oauthStates.has(state)) return false;
+  oauthStates.delete(state);
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of oauthStates) { if (v < now) oauthStates.delete(k); }
+}, 60000);
 
 // ── Initialize SQLite ──────────────────────────────────────────
 const dbPath = path.join(__dirname, "omnis.db");
@@ -77,7 +98,8 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   unionId TEXT NOT NULL UNIQUE,
   name TEXT,
-  email TEXT,
+  email TEXT UNIQUE,
+  password TEXT,
   avatar TEXT,
   role TEXT DEFAULT 'user' NOT NULL,
   createdAt INTEGER NOT NULL,
@@ -206,12 +228,13 @@ if (clientsCount.c === 0) {
   sqlite.exec("DELETE FROM proposals");
   sqlite.exec("DELETE FROM website_projects");
   sqlite.exec("DELETE FROM business_leads");
+  
   const leads = [
     ["Sunrise Bakery", "Food & Beverage", "123 Main St, Austin, TX", "(512) 555-0101", "hello@sunrisebakery.com", 0, "google_maps", "contacted", "Agent Alpha", "No website. Only Facebook page.", now-30*day, now-2*day],
     ["Downtown Dental Care", "Healthcare", "456 Oak Ave, Portland, OR", "(503) 555-0202", "info@downtowndental.com", 0, "yelp_scraper", "qualified", "Agent Beta", "Established practice, 4.8 stars on Yelp.", now-45*day, now-5*day],
     ["Elite Fitness Studio", "Fitness & Wellness", "789 Gym Blvd, Miami, FL", "(305) 555-0303", "contact@elitefitness.com", 0, "facebook_ads", "new", "Agent Gamma", "Instagram only. No booking system.", now-7*day, now-7*day],
     ["River Valley Plumbing", "Home Services", "321 River Rd, Denver, CO", "(720) 555-0404", "service@rivervalleyplumbing.com", 0, "google_maps", "negotiating", "Agent Delta", "Family business 15 years.", now-60*day, now-1*day],
-    ["Parkside Café & Books", "Retail & Hospitality", "654 Park Ln, Seattle, WA", "(206) 555-0505", "hello@parksidecafe.com", 0, "yelp_scraper", "qualified", "Agent Alpha", "Unique concept. 4.9 stars.", now-14*day, now-3*day],
+    ["Parkside Cafe & Books", "Retail & Hospitality", "654 Park Ln, Seattle, WA", "(206) 555-0505", "hello@parksidecafe.com", 0, "yelp_scraper", "qualified", "Agent Alpha", "Unique concept. 4.9 stars.", now-14*day, now-3*day],
     ["Golden Paws Pet Grooming", "Pet Services", "753 Bark Ave, San Diego, CA", "(619) 555-1010", "groom@goldenpaws.com", 0, "google_maps", "closed_won", "Agent Beta", "Converted! Full ownership package.", now-120*day, now-30*day],
     ["Precision Tax Advisors", "Professional Services", "579 Number St, Atlanta, GA", "(404) 555-1616", "tax@precisionadvisors.com", 0, "google_maps", "closed_won", "Agent Delta", "Converted! Subscription model.", now-150*day, now-45*day],
   ];
@@ -274,9 +297,10 @@ if (clientsCount.c === 0) {
   const insertWorkflow = sqlite.prepare("INSERT INTO workflow_runs (workflow_name, workflow_type, status, steps_completed, total_steps, started_at, completed_at, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
   for (const w of workflows) insertWorkflow.run(...w);
 
-  const users = [["demo_user", "CEO", "ceo@omnis.systems", null, "admin", now-200*day, now-1*day, now-1*day]];
-  const insertUser = sqlite.prepare("INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-  for (const u of users) insertUser.run(...u);
+  // Seed admin user with password
+  const adminPassword = hashPassword("admin123");
+  sqlite.prepare("INSERT INTO users (unionId, name, email, password, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("local_1", "Admin", "admin@omnis.systems", adminPassword, null, "admin", now-200*day, now, now);
 }
 
 // ── Helper: parse tRPC body ───────────────────────────────────
@@ -287,15 +311,6 @@ async function parseBody(c) {
   } catch {
     return {};
   }
-}
-
-// ── Helper: get current user from JWT ──────────────────────────
-function getCurrentUser(c) {
-  const token = getCookie(c, "omnis_session");
-  if (!token) return null;
-  const payload = verifyJWT(token);
-  if (!payload) return null;
-  return sqlite.prepare("SELECT * FROM users WHERE id = ?").get(payload.userId) || null;
 }
 
 // ── Hono App ───────────────────────────────────────────────────
@@ -313,9 +328,7 @@ app.use("*", async (c, next) => {
 // Body limit
 app.use("*", async (c, next) => {
   const contentLength = parseInt(c.req.header("content-length") || "0");
-  if (contentLength > 50 * 1024 * 1024) {
-    return c.json({ error: "Payload too large" }, 413);
-  }
+  if (contentLength > 50 * 1024 * 1024) return c.json({ error: "Payload too large" }, 413);
   await next();
 });
 
@@ -323,7 +336,55 @@ app.use("*", async (c, next) => {
 app.get("/api/ping", (c) => c.json({ ok: true, ts: Date.now() }));
 app.get("/api/trpc/ping", (c) => c.json({ ok: true, ts: Date.now() }));
 
-// ── Auth ───────────────────────────────────────────────────────
+// ── Built-in Auth (Email/Password) ─────────────────────────────
+app.post("/api/auth/register", async (c) => {
+  const body = await parseBody(c);
+  const { name, email, password } = body;
+  if (!name || !email || !password) return c.json({ error: "Name, email, and password required" }, 400);
+  if (password.length < 6) return c.json({ error: "Password must be at least 6 characters" }, 400);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "Invalid email" }, 400);
+  
+  const existing = sqlite.prepare("SELECT id FROM users WHERE email = ?").get(email);
+  if (existing) return c.json({ error: "Email already registered" }, 409);
+  
+  const timestamp = Date.now();
+  const hashed = hashPassword(password);
+  const unionId = `local_${timestamp}`;
+  const result = sqlite.prepare("INSERT INTO users (unionId, name, email, password, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(unionId, name, email, hashed, null, "user", timestamp, timestamp, timestamp);
+  
+  const user = sqlite.prepare("SELECT id, unionId, name, email, avatar, role FROM users WHERE id = ?").get(result.lastInsertRowid);
+  const token = signJWT({ userId: user.id, unionId: user.unionId, email: user.email, role: user.role });
+  return c.json({ result: { data: { user, token } } });
+});
+
+app.post("/api/auth/login", async (c) => {
+  const body = await parseBody(c);
+  const { email, password } = body;
+  if (!email || !password) return c.json({ error: "Email and password required" }, 400);
+  
+  const user = sqlite.prepare("SELECT id, unionId, name, email, password, avatar, role FROM users WHERE email = ?").get(email);
+  if (!user || !verifyPassword(password, user.password)) return c.json({ error: "Invalid email or password" }, 401);
+  
+  const timestamp = Date.now();
+  sqlite.prepare("UPDATE users SET lastSignInAt = ? WHERE id = ?").run(timestamp, user.id);
+  
+  const token = signJWT({ userId: user.id, unionId: user.unionId, email: user.email, role: user.role });
+  const { password: _, ...userWithoutPassword } = user;
+  return c.json({ result: { data: { user: userWithoutPassword, token } } });
+});
+
+app.post("/api/trpc/auth.me", (c) => {
+  const user = getCurrentUser(c);
+  if (!user) return c.json({ result: { data: null } });
+  return c.json({ result: { data: { id: user.id, unionId: user.unionId, name: user.name, email: user.email, avatar: user.avatar, role: user.role } } });
+});
+
+app.post("/api/trpc/auth.logout", (c) => {
+  return c.json({ result: { data: { success: true } } });
+});
+
+// ── Google OAuth ─────────────────────────────────────────────────
 app.get("/api/auth/google", (c) => {
   if (!GOOGLE_CLIENT_ID) return c.json({ error: "Google OAuth not configured" }, 500);
   const state = generateState();
@@ -343,58 +404,43 @@ app.get("/api/auth/google/callback", async (c) => {
   const code = c.req.query("code");
   const state = c.req.query("state");
   if (!code || !verifyState(state)) return c.json({ error: "Invalid state or missing code" }, 400);
-
   try {
     const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        code,
-        redirect_uri: `${OAUTH_REDIRECT_URL}/api/auth/google/callback`,
+        client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
+        code, redirect_uri: `${OAUTH_REDIRECT_URL}/api/auth/google/callback`,
         grant_type: "authorization_code",
       }),
     });
     const tokenData = await tokenResponse.json();
     if (!tokenData.access_token) return c.json({ error: "Failed to get access token" }, 400);
-
     const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
     const userData = await userResponse.json();
     if (!userData.id) return c.json({ error: "Failed to get user info" }, 400);
-
     const unionId = `google_${userData.id}`;
-    const existingUser = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
+    const existing = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
     const timestamp = Date.now();
-
-    if (existingUser) {
+    if (existing) {
       sqlite.prepare("UPDATE users SET name = ?, email = ?, avatar = ?, lastSignInAt = ? WHERE id = ?")
-        .run(userData.name || existingUser.name, userData.email || existingUser.email, userData.picture || existingUser.avatar, timestamp, existingUser.id);
+        .run(userData.name || existing.name, userData.email || existing.email, userData.picture || existing.avatar, timestamp, existing.id);
     } else {
       sqlite.prepare("INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .run(unionId, userData.name || userData.email, userData.email, userData.picture, "user", timestamp, timestamp, timestamp);
     }
-
     const user = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
     const token = signJWT({ userId: user.id, unionId: user.unionId, email: user.email, role: user.role });
-
-    setCookie(c, "omnis_session", token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: "Lax",
-      maxAge: 7 * 24 * 60 * 60,
-      path: "/",
-    });
-
-    return c.redirect("https://dashboard.kisife.com", 302);
+    return c.json({ result: { data: { token, user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, role: user.role } } } });
   } catch (err) {
     console.error("Google OAuth error:", err);
     return c.json({ error: "OAuth failed", details: err.message }, 500);
   }
 });
 
+// ── GitHub OAuth ─────────────────────────────────────────────────
 app.get("/api/auth/github", (c) => {
   if (!GITHUB_CLIENT_ID) return c.json({ error: "GitHub OAuth not configured" }, 500);
   const state = generateState();
@@ -411,40 +457,23 @@ app.get("/api/auth/github/callback", async (c) => {
   const code = c.req.query("code");
   const state = c.req.query("state");
   if (!code || !verifyState(state)) return c.json({ error: "Invalid state or missing code" }, 400);
-
   try {
     const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        client_id: GITHUB_CLIENT_ID,
-        client_secret: GITHUB_CLIENT_SECRET,
-        code,
-        redirect_uri: `${OAUTH_REDIRECT_URL}/api/auth/github/callback`,
-      }),
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, client_secret: GITHUB_CLIENT_SECRET, code, redirect_uri: `${OAUTH_REDIRECT_URL}/api/auth/github/callback` }),
     });
     const tokenData = await tokenResponse.json();
     if (!tokenData.access_token) return c.json({ error: "Failed to get access token" }, 400);
-
     const userResponse = await fetch("https://api.github.com/user", {
-      headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
-        "User-Agent": "OMNIS-App",
-      },
+      headers: { Authorization: `Bearer ${tokenData.access_token}`, "User-Agent": "OMNIS-App" },
     });
     const userData = await userResponse.json();
     if (!userData.id) return c.json({ error: "Failed to get user info" }, 400);
-
     let email = userData.email;
     if (!email) {
       const emailResponse = await fetch("https://api.github.com/user/emails", {
-        headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
-          "User-Agent": "OMNIS-App",
-        },
+        headers: { Authorization: `Bearer ${tokenData.access_token}`, "User-Agent": "OMNIS-App" },
       });
       const emails = await emailResponse.json();
       if (Array.isArray(emails) && emails.length > 0) {
@@ -452,46 +481,23 @@ app.get("/api/auth/github/callback", async (c) => {
         email = primary.email;
       }
     }
-
     const unionId = `github_${userData.id}`;
-    const existingUser = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
+    const existing = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
     const timestamp = Date.now();
-
-    if (existingUser) {
+    if (existing) {
       sqlite.prepare("UPDATE users SET name = ?, email = ?, avatar = ?, lastSignInAt = ? WHERE id = ?")
-        .run(userData.name || userData.login || existingUser.name, email || existingUser.email, userData.avatar_url || existingUser.avatar, timestamp, existingUser.id);
+        .run(userData.name || userData.login || existing.name, email || existing.email, userData.avatar_url || existing.avatar, timestamp, existing.id);
     } else {
       sqlite.prepare("INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .run(unionId, userData.name || userData.login, email, userData.avatar_url, "user", timestamp, timestamp, timestamp);
     }
-
     const user = sqlite.prepare("SELECT * FROM users WHERE unionId = ?").get(unionId);
     const token = signJWT({ userId: user.id, unionId: user.unionId, email: user.email, role: user.role });
-
-    setCookie(c, "omnis_session", token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: "Lax",
-      maxAge: 7 * 24 * 60 * 60,
-      path: "/",
-    });
-
-    return c.redirect("https://dashboard.kisife.com", 302);
+    return c.json({ result: { data: { token, user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, role: user.role } } } });
   } catch (err) {
     console.error("GitHub OAuth error:", err);
     return c.json({ error: "OAuth failed", details: err.message }, 500);
   }
-});
-
-app.post("/api/trpc/auth.me", (c) => {
-  const user = getCurrentUser(c);
-  if (!user) return c.json({ result: { data: null } });
-  return c.json({ result: { data: { id: user.id, unionId: user.unionId, name: user.name, email: user.email, avatar: user.avatar, role: user.role } } });
-});
-
-app.post("/api/trpc/auth.logout", (c) => {
-  deleteCookie(c, "omnis_session", { path: "/" });
-  return c.json({ result: { data: { success: true } } });
 });
 
 // ── Dashboard ──────────────────────────────────────────────────
@@ -546,18 +552,9 @@ app.post("/api/trpc/lead.create", async (c) => {
   const result = sqlite.prepare(
     "INSERT INTO business_leads (business_name, category, address, phone, email, has_website, discovery_source, status, assigned_agent, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
-    body.business_name || "",
-    body.category || null,
-    body.address || null,
-    body.phone || null,
-    body.email || null,
-    body.has_website ? 1 : 0,
-    body.discovery_source || null,
-    body.status || "new",
-    body.assigned_agent || null,
-    body.notes || null,
-    now,
-    now
+    body.business_name || "", body.category || null, body.address || null, body.phone || null,
+    body.email || null, body.has_website ? 1 : 0, body.discovery_source || null, body.status || "new",
+    body.assigned_agent || null, body.notes || null, now, now
   );
   const item = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
@@ -569,23 +566,15 @@ app.post("/api/trpc/lead.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Lead not found" } }, 404);
-
   const now = Date.now();
   sqlite.prepare(
     "UPDATE business_leads SET business_name = ?, category = ?, address = ?, phone = ?, email = ?, has_website = ?, discovery_source = ?, status = ?, assigned_agent = ?, notes = ?, updated_at = ? WHERE id = ?"
   ).run(
-    body.business_name ?? existing.business_name,
-    body.category ?? existing.category,
-    body.address ?? existing.address,
-    body.phone ?? existing.phone,
-    body.email ?? existing.email,
+    body.business_name ?? existing.business_name, body.category ?? existing.category,
+    body.address ?? existing.address, body.phone ?? existing.phone, body.email ?? existing.email,
     body.has_website !== undefined ? (body.has_website ? 1 : 0) : existing.has_website,
-    body.discovery_source ?? existing.discovery_source,
-    body.status ?? existing.status,
-    body.assigned_agent ?? existing.assigned_agent,
-    body.notes ?? existing.notes,
-    now,
-    id
+    body.discovery_source ?? existing.discovery_source, body.status ?? existing.status,
+    body.assigned_agent ?? existing.assigned_agent, body.notes ?? existing.notes, now, id
   );
   const item = sqlite.prepare("SELECT * FROM business_leads WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
@@ -627,16 +616,8 @@ app.post("/api/trpc/client.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO clients (lead_id, contract_id, client_status, website_url, last_payment_at, next_payment_at, total_revenue, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.lead_id || 0,
-    body.contract_id || 0,
-    body.client_status || "active",
-    body.website_url || null,
-    body.last_payment_at || null,
-    body.next_payment_at || null,
-    body.total_revenue || 0,
-    now
-  );
+  ).run(body.lead_id || 0, body.contract_id || 0, body.client_status || "active", body.website_url || null,
+    body.last_payment_at || null, body.next_payment_at || null, body.total_revenue || 0, now);
   const item = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -647,19 +628,11 @@ app.post("/api/trpc/client.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Client not found" } }, 404);
-
   sqlite.prepare(
     "UPDATE clients SET lead_id = ?, contract_id = ?, client_status = ?, website_url = ?, last_payment_at = ?, next_payment_at = ?, total_revenue = ? WHERE id = ?"
-  ).run(
-    body.lead_id ?? existing.lead_id,
-    body.contract_id ?? existing.contract_id,
-    body.client_status ?? existing.client_status,
-    body.website_url ?? existing.website_url,
-    body.last_payment_at ?? existing.last_payment_at,
-    body.next_payment_at ?? existing.next_payment_at,
-    body.total_revenue ?? existing.total_revenue,
-    id
-  );
+  ).run(body.lead_id ?? existing.lead_id, body.contract_id ?? existing.contract_id, body.client_status ?? existing.client_status,
+    body.website_url ?? existing.website_url, body.last_payment_at ?? existing.last_payment_at, body.next_payment_at ?? existing.next_payment_at,
+    body.total_revenue ?? existing.total_revenue, id);
   const item = sqlite.prepare("SELECT * FROM clients WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -695,19 +668,8 @@ app.post("/api/trpc/proposal.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO proposals (lead_id, project_id, proposal_type, monthly_fee, setup_fee, total_price, included_services, status, sent_at, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.lead_id || 0,
-    body.project_id || null,
-    body.proposal_type || null,
-    body.monthly_fee || 0,
-    body.setup_fee || 0,
-    body.total_price || 0,
-    body.included_services || null,
-    body.status || "draft",
-    body.sent_at || null,
-    body.expires_at || null,
-    now
-  );
+  ).run(body.lead_id || 0, body.project_id || null, body.proposal_type || null, body.monthly_fee || 0, body.setup_fee || 0,
+    body.total_price || 0, body.included_services || null, body.status || "draft", body.sent_at || null, body.expires_at || null, now);
   const item = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -718,22 +680,12 @@ app.post("/api/trpc/proposal.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Proposal not found" } }, 404);
-
   sqlite.prepare(
     "UPDATE proposals SET lead_id = ?, project_id = ?, proposal_type = ?, monthly_fee = ?, setup_fee = ?, total_price = ?, included_services = ?, status = ?, sent_at = ?, expires_at = ? WHERE id = ?"
-  ).run(
-    body.lead_id ?? existing.lead_id,
-    body.project_id ?? existing.project_id,
-    body.proposal_type ?? existing.proposal_type,
-    body.monthly_fee ?? existing.monthly_fee,
-    body.setup_fee ?? existing.setup_fee,
-    body.total_price ?? existing.total_price,
-    body.included_services ?? existing.included_services,
-    body.status ?? existing.status,
-    body.sent_at ?? existing.sent_at,
-    body.expires_at ?? existing.expires_at,
-    id
-  );
+  ).run(body.lead_id ?? existing.lead_id, body.project_id ?? existing.project_id, body.proposal_type ?? existing.proposal_type,
+    body.monthly_fee ?? existing.monthly_fee, body.setup_fee ?? existing.setup_fee, body.total_price ?? existing.total_price,
+    body.included_services ?? existing.included_services, body.status ?? existing.status, body.sent_at ?? existing.sent_at,
+    body.expires_at ?? existing.expires_at, id);
   const item = sqlite.prepare("SELECT * FROM proposals WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -769,18 +721,8 @@ app.post("/api/trpc/contract.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO contracts (proposal_id, lead_id, contract_type, contract_status, contract_content, signature_url, signed_at, expires_at, monthly_recurring_revenue, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.proposal_id || 0,
-    body.lead_id || 0,
-    body.contract_type || null,
-    body.contract_status || "draft",
-    body.contract_content || null,
-    body.signature_url || null,
-    body.signed_at || null,
-    body.expires_at || null,
-    body.monthly_recurring_revenue || 0,
-    now
-  );
+  ).run(body.proposal_id || 0, body.lead_id || 0, body.contract_type || null, body.contract_status || "draft",
+    body.contract_content || null, body.signature_url || null, body.signed_at || null, body.expires_at || null, body.monthly_recurring_revenue || 0, now);
   const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -791,21 +733,11 @@ app.post("/api/trpc/contract.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Contract not found" } }, 404);
-
   sqlite.prepare(
     "UPDATE contracts SET proposal_id = ?, lead_id = ?, contract_type = ?, contract_status = ?, contract_content = ?, signature_url = ?, signed_at = ?, expires_at = ?, monthly_recurring_revenue = ? WHERE id = ?"
-  ).run(
-    body.proposal_id ?? existing.proposal_id,
-    body.lead_id ?? existing.lead_id,
-    body.contract_type ?? existing.contract_type,
-    body.contract_status ?? existing.contract_status,
-    body.contract_content ?? existing.contract_content,
-    body.signature_url ?? existing.signature_url,
-    body.signed_at ?? existing.signed_at,
-    body.expires_at ?? existing.expires_at,
-    body.monthly_recurring_revenue ?? existing.monthly_recurring_revenue,
-    id
-  );
+  ).run(body.proposal_id ?? existing.proposal_id, body.lead_id ?? existing.lead_id, body.contract_type ?? existing.contract_type,
+    body.contract_status ?? existing.contract_status, body.contract_content ?? existing.contract_content, body.signature_url ?? existing.signature_url,
+    body.signed_at ?? existing.signed_at, body.expires_at ?? existing.expires_at, body.monthly_recurring_revenue ?? existing.monthly_recurring_revenue, id);
   const item = sqlite.prepare("SELECT * FROM contracts WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -841,19 +773,8 @@ app.post("/api/trpc/website_project.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO website_projects (lead_id, project_name, status, design_url, template_used, pages_built, total_pages, build_progress, preview_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.lead_id || 0,
-    body.project_name || null,
-    body.status || "draft",
-    body.design_url || null,
-    body.template_used || null,
-    body.pages_built || 0,
-    body.total_pages || 5,
-    body.build_progress || 0,
-    body.preview_url || null,
-    now,
-    now
-  );
+  ).run(body.lead_id || 0, body.project_name || null, body.status || "draft", body.design_url || null, body.template_used || null,
+    body.pages_built || 0, body.total_pages || 5, body.build_progress || 0, body.preview_url || null, now, now);
   const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -864,23 +785,12 @@ app.post("/api/trpc/website_project.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Project not found" } }, 404);
-
   const now = Date.now();
   sqlite.prepare(
     "UPDATE website_projects SET lead_id = ?, project_name = ?, status = ?, design_url = ?, template_used = ?, pages_built = ?, total_pages = ?, build_progress = ?, preview_url = ?, updated_at = ? WHERE id = ?"
-  ).run(
-    body.lead_id ?? existing.lead_id,
-    body.project_name ?? existing.project_name,
-    body.status ?? existing.status,
-    body.design_url ?? existing.design_url,
-    body.template_used ?? existing.template_used,
-    body.pages_built ?? existing.pages_built,
-    body.total_pages ?? existing.total_pages,
-    body.build_progress ?? existing.build_progress,
-    body.preview_url ?? existing.preview_url,
-    now,
-    id
-  );
+  ).run(body.lead_id ?? existing.lead_id, body.project_name ?? existing.project_name, body.status ?? existing.status,
+    body.design_url ?? existing.design_url, body.template_used ?? existing.template_used, body.pages_built ?? existing.pages_built,
+    body.total_pages ?? existing.total_pages, body.build_progress ?? existing.build_progress, body.preview_url ?? existing.preview_url, now, id);
   const item = sqlite.prepare("SELECT * FROM website_projects WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -916,14 +826,7 @@ app.post("/api/trpc/payment.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO payments (client_id, amount, payment_type, status, paid_at, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.client_id || 0,
-    body.amount || 0,
-    body.payment_type || null,
-    body.status || "pending",
-    body.paid_at || null,
-    now
-  );
+  ).run(body.client_id || 0, body.amount || 0, body.payment_type || null, body.status || "pending", body.paid_at || null, now);
   const item = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -934,17 +837,10 @@ app.post("/api/trpc/payment.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Payment not found" } }, 404);
-
   sqlite.prepare(
     "UPDATE payments SET client_id = ?, amount = ?, payment_type = ?, status = ?, paid_at = ? WHERE id = ?"
-  ).run(
-    body.client_id ?? existing.client_id,
-    body.amount ?? existing.amount,
-    body.payment_type ?? existing.payment_type,
-    body.status ?? existing.status,
-    body.paid_at ?? existing.paid_at,
-    id
-  );
+  ).run(body.client_id ?? existing.client_id, body.amount ?? existing.amount, body.payment_type ?? existing.payment_type,
+    body.status ?? existing.status, body.paid_at ?? existing.paid_at, id);
   const item = sqlite.prepare("SELECT * FROM payments WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -971,15 +867,8 @@ app.post("/api/trpc/agentLog.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO agent_logs (agent_name, agent_type, action, target_lead_id, status, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.agent_name || null,
-    body.agent_type || null,
-    body.action || null,
-    body.target_lead_id || null,
-    body.status || null,
-    body.metadata ? JSON.stringify(body.metadata) : null,
-    now
-  );
+  ).run(body.agent_name || null, body.agent_type || null, body.action || null, body.target_lead_id || null,
+    body.status || null, body.metadata ? JSON.stringify(body.metadata) : null, now);
   const item = sqlite.prepare("SELECT * FROM agent_logs WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -999,16 +888,8 @@ app.post("/api/trpc/workflow.create", async (c) => {
   const now = Date.now();
   const result = sqlite.prepare(
     "INSERT INTO workflow_runs (workflow_name, workflow_type, status, steps_completed, total_steps, started_at, completed_at, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.workflow_name || null,
-    body.workflow_type || null,
-    body.status || "pending",
-    body.steps_completed || 0,
-    body.total_steps || 0,
-    now,
-    body.completed_at || null,
-    body.error_message || null
-  );
+  ).run(body.workflow_name || null, body.workflow_type || null, body.status || "pending", body.steps_completed || 0,
+    body.total_steps || 0, now, body.completed_at || null, body.error_message || null);
   const item = sqlite.prepare("SELECT * FROM workflow_runs WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
@@ -1019,19 +900,11 @@ app.post("/api/trpc/workflow.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM workflow_runs WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "Workflow not found" } }, 404);
-
   sqlite.prepare(
     "UPDATE workflow_runs SET workflow_name = ?, workflow_type = ?, status = ?, steps_completed = ?, total_steps = ?, completed_at = ?, error_message = ? WHERE id = ?"
-  ).run(
-    body.workflow_name ?? existing.workflow_name,
-    body.workflow_type ?? existing.workflow_type,
-    body.status ?? existing.status,
-    body.steps_completed ?? existing.steps_completed,
-    body.total_steps ?? existing.total_steps,
-    body.completed_at ?? existing.completed_at,
-    body.error_message ?? existing.error_message,
-    id
-  );
+  ).run(body.workflow_name ?? existing.workflow_name, body.workflow_type ?? existing.workflow_type, body.status ?? existing.status,
+    body.steps_completed ?? existing.steps_completed, body.total_steps ?? existing.total_steps, body.completed_at ?? existing.completed_at,
+    body.error_message ?? existing.error_message, id);
   const item = sqlite.prepare("SELECT * FROM workflow_runs WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
@@ -1046,18 +919,10 @@ app.post("/api/trpc/user.create", async (c) => {
   const body = await parseBody(c);
   const now = Date.now();
   const result = sqlite.prepare(
-    "INSERT INTO users (unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    body.unionId || "",
-    body.name || null,
-    body.email || null,
-    body.avatar || null,
-    body.role || "user",
-    now,
-    now,
-    now
-  );
-  const item = sqlite.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
+    "INSERT INTO users (unionId, name, email, password, avatar, role, createdAt, updatedAt, lastSignInAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(body.unionId || "", body.name || null, body.email || null, body.password ? hashPassword(body.password) : null,
+    body.avatar || null, body.role || "user", now, now, now);
+  const item = sqlite.prepare("SELECT id, unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt FROM users WHERE id = ?").get(result.lastInsertRowid);
   return c.json({ result: { data: item } });
 });
 
@@ -1067,20 +932,12 @@ app.post("/api/trpc/user.update", async (c) => {
   if (!id) return c.json({ error: { message: "ID required" } }, 400);
   const existing = sqlite.prepare("SELECT * FROM users WHERE id = ?").get(id);
   if (!existing) return c.json({ error: { message: "User not found" } }, 404);
-
   const now = Date.now();
   sqlite.prepare(
     "UPDATE users SET unionId = ?, name = ?, email = ?, avatar = ?, role = ?, updatedAt = ? WHERE id = ?"
-  ).run(
-    body.unionId ?? existing.unionId,
-    body.name ?? existing.name,
-    body.email ?? existing.email,
-    body.avatar ?? existing.avatar,
-    body.role ?? existing.role,
-    now,
-    id
-  );
-  const item = sqlite.prepare("SELECT * FROM users WHERE id = ?").get(id);
+  ).run(body.unionId ?? existing.unionId, body.name ?? existing.name, body.email ?? existing.email,
+    body.avatar ?? existing.avatar, body.role ?? existing.role, now, id);
+  const item = sqlite.prepare("SELECT id, unionId, name, email, avatar, role, createdAt, updatedAt, lastSignInAt FROM users WHERE id = ?").get(id);
   return c.json({ result: { data: item } });
 });
 
